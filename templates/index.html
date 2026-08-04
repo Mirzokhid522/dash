@@ -116,6 +116,10 @@
                         <td>{{ pair.bias }}</td>
                         <td>{{ pair.score }}</td>
                     </tr>
+                {% else %}
+                    <tr class="row-neutral">
+                        <td colspan="3" style="text-align: center;">No currency pairs available.</td>
+                    </tr>
                 {% endfor %}
             </tbody>
         </table>

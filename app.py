@@ -1,6 +1,6 @@
 import os
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, render_template
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -8,18 +8,10 @@ load_dotenv()
 app = Flask(__name__)
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+DB_KEYS = ["DB_USD", "DB_AUD", "DB_EUR", "DB_GBP", "DB_CAD", "DB_CHF", "DB_JPY", "DB_NZD"]
 
-# Map your currency database IDs
-DATABASES = {
-    "USD": os.getenv("DB_USD"),
-    "AUD": os.getenv("DB_AUD"),
-    "EUR": os.getenv("DB_EUR"),
-    "GBP": os.getenv("DB_GBP"),
-    "CAD": os.getenv("DB_CAD"),
-    "CHF": os.getenv("DB_CHF"),
-    "JPY": os.getenv("DB_JPY"),
-    "NZD": os.getenv("DB_NZD")
-}
+# Standard global market hierarchy for tradeable forex pairs
+FX_HIERARCHY = ["EUR", "GBP", "AUD", "NZD", "USD", "CAD", "CHF", "JPY"]
 
 HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -27,91 +19,141 @@ HEADERS = {
     "Notion-Version": "2022-06-28"
 }
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+@app.route("/")
+def dashboard():
+    debug_logs = []
+    debug_logs.append(f"Token Present: {bool(NOTION_TOKEN)}")
 
-@app.route('/api/score', methods=['GET'])
-def get_macro_score():
-    # Default to NZD or USD if no currency is specified, e.g. /api/score?currency=NZD
-    currency = request.args.get('currency', 'NZD').upper()
-    database_id = DATABASES.get(currency)
+    currencies = {}
+   
+    if not NOTION_TOKEN:
+        debug_logs.append("Error: Missing Notion Token.")
+    else:
+        for db_key in DB_KEYS:
+            db_id = os.getenv(db_key)
+            if not db_id:
+                continue
+           
+            # Use database key name as fallback currency code (e.g., DB_NZD -> NZD)
+            fallback_code = db_key.replace("DB_", "")
+           
+            url = f"https://api.notion.com/v1/databases/{db_id}/query"
+            try:
+                response = requests.post(url, headers=HEADERS, timeout=5)
+                debug_logs.append(f"{db_key} Status: {response.status_code}")
+               
+                if response.status_code == 200:
+                    data = response.json()
+                    results = data.get("results", [])
+                   
+                    for page in results:
+                        props = page.get("properties", {})
+                       
+                        curr_name = fallback_code
+                        score = 0.0
+                        bias = "Neutral"
 
-    if not database_id:
-        return jsonify({"error": f"Invalid or missing database ID for currency: {currency}", "score": 0.0, "status": "Error"}), 400
+                        for prop_name, prop_data in props.items():
+                            p_type = prop_data.get("type")
+                           
+                            # 1. Title property
+                            if p_type == "title":
+                                t_list = prop_data.get("title", [])
+                                if t_list and t_list[0].get("plain_text", "").strip():
+                                    curr_name = t_list[0].get("plain_text").strip().upper()
 
-    try:
-        url = f"https://api.notion.com/v1/databases/{database_id}/query"
-        response = requests.post(url, headers=HEADERS, timeout=5)
-        
-        if response.status_code != 200:
-            print(f"Notion API Error ({currency}): {response.status_code} - {response.text}")
-            return jsonify({"error": f"Notion API error {response.status_code}", "score": 0.0, "status": "Error"}), 500
+                            # 2. Extract Score (Rollup, Number, or Formula)
+                            elif prop_name in ["Score", "Final Score"]:
+                                if p_type == "rollup":
+                                    score = prop_data.get("rollup", {}).get("number") or 0.0
+                                elif p_type == "number":
+                                    score = prop_data.get("number") or 0.0
+                                elif p_type == "formula":
+                                    score = prop_data.get("formula", {}).get("number") or 0.0
 
-        data = response.json()
-        results = data.get("results", [])
-        
-        total_score = 0.0
-        count = 0
-        extracted_bias = None
+                            # 3. Extract Bias from Formula or Select/Status
+                            elif prop_name == "Bias":
+                                if p_type == "formula":
+                                    f_data = prop_data.get("formula", {})
+                                    if f_data.get("type") == "string":
+                                        bias = f_data.get("string", "Neutral")
+                                elif p_type == "select":
+                                    bias = prop_data.get("select", {}).get("name", "Neutral")
+                                elif p_type == "status":
+                                    bias = prop_data.get("status", {}).get("name", "Neutral")
 
-        for page in results:
-            props = page.get("properties", {})
-            
-            for prop_name, prop_data in props.items():
-                p_lower = prop_name.lower()
-                p_type = prop_data.get("type")
+                        currencies[curr_name] = {
+                            "score": float(score),
+                            "bias": bias
+                        }
+                else:
+                    debug_logs.append(f"{db_key} Error: {response.status_code}")
+            except requests.exceptions.Timeout:
+                debug_logs.append(f"Error: {db_key} request timed out.")
+            except Exception as e:
+                debug_logs.append(f"Exception on {db_key}: {e}")
 
-                # 1. Extract Score
-                if p_lower in ["score", "final score"]:
-                    val = None
-                    if p_type == "rollup":
-                        val = prop_data.get("rollup", {}).get("number")
-                    elif p_type == "number":
-                        val = prop_data.get("number")
-                    elif p_type == "formula":
-                        val = prop_data.get("formula", {}).get("number")
+    debug_logs.append(f"Parsed Currencies: {list(currencies.keys())}")
 
-                    if val is not None:
-                        total_score += float(val)
-                        count += 1
-
-                # 2. Extract Bias
-                elif p_lower == "bias":
-                    if p_type == "select":
-                        extracted_bias = prop_data.get("select", {}).get("name")
-                    elif p_type == "status":
-                        extracted_bias = prop_data.get("status", {}).get("name")
-                    elif p_type == "formula":
-                        f_data = prop_data.get("formula", {})
-                        if f_data.get("type") == "string":
-                            extracted_bias = f_data.get("string")
-
-        score = round(total_score, 4) if count > 0 else 0.0
-
-        if extracted_bias:
-            status = extracted_bias
-        else:
-            if score > 0.3:
-                status = "Very Bullish"
-            elif score > 0.05:
-                status = "Bullish"
-            elif score < -0.3:
-                status = "Very Bearish"
-            elif score < -0.05:
-                status = "Bearish"
+    # Generate standard tradeable pairs & calculate differential scores using market hierarchy
+    derived_pairs = []
+    available_currs = list(currencies.keys())
+   
+    for i in range(len(available_currs)):
+        for j in range(len(available_currs)):
+            curr_a = available_currs[i]
+            curr_b = available_currs[j]
+           
+            if curr_a == curr_b:
+                continue
+               
+            try:
+                pos_a = FX_HIERARCHY.index(curr_a)
+                pos_b = FX_HIERARCHY.index(curr_b)
+            except ValueError:
+                continue  # Skip currencies not recognized in the hierarchy
+               
+            # Enforce institutional market hierarchy (Base / Quote)
+            if pos_a < pos_b:
+                base = curr_a
+                quote = curr_b
             else:
-                status = "Neutral"
+                base = curr_b
+                quote = curr_a
+               
+            pair_symbol = f"{base}{quote}"
+           
+            # Prevent duplicate pairs
+            if any(item['symbol'] == pair_symbol for item in derived_pairs):
+                continue
+           
+            base_score = currencies[base]["score"]
+            quote_score = currencies[quote]["score"]
+           
+            diff_score = round(base_score - quote_score, 4)
+           
+            # Dynamic bias threshold mapping
+            if diff_score >= 2.0:
+                pair_bias = "Very Bullish"
+            elif diff_score > 0.0:
+                pair_bias = "Bullish"
+            elif diff_score == 0.0:
+                pair_bias = "Neutral"
+            elif diff_score > -2.0:
+                pair_bias = "Bearish"
+            else:
+                pair_bias = "Very Bearish"
 
-        return jsonify({
-            "currency": currency,
-            "score": score,
-            "status": status
-        })
+            derived_pairs.append({
+                "symbol": pair_symbol,
+                "score": diff_score,
+                "bias": pair_bias
+            })
 
-    except Exception as e:
-        print(f"Server Error: {e}")
-        return jsonify({"error": str(e), "score": 0.0, "status": "Error"}), 500
+    # Sort descending by differential score
+    derived_pairs = sorted(derived_pairs, key=lambda x: x["score"], reverse=True)
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    return render_template("index.html", derived_pairs=derived_pairs, debug_logs=debug_logs)
+
+if __name__ == "__main__":
+    app.run(debug=True)
